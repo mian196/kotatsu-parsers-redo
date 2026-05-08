@@ -196,7 +196,7 @@ internal class Ryzukomik(context: MangaLoaderContext) :
 				branch = null,
 				source = source,
 			)
-		}.sortedByDescending { it.number }
+		}.sortedBy { it.number }
 	}
 
 	override suspend fun getPages(chapter: MangaChapter): List<MangaPage> {
