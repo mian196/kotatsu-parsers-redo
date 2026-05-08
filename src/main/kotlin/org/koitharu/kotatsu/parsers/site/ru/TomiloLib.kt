@@ -160,7 +160,7 @@ internal class TomiloLib(context: MangaLoaderContext) :
 			.mapNotNull { chapters.optJSONObject(it) }
 			.firstOrNull { it.getStringOrNull("_id") == chapterId }
 			?: throw ParseException("Cannot find chapter pages", chapter.url)
-		return parsePages(chapterJson.optJSONArray("pages"), chapter.url)
+		return parsePages(chapterJson.optJSONArray("pages"), chapter.url, titleId)
 	}
 
 	private suspend fun fetchFilterOptions(): MangaListFilterOptions = MangaListFilterOptions(
@@ -269,13 +269,13 @@ internal class TomiloLib(context: MangaLoaderContext) :
 		}
 	}
 
-	private fun parsePages(pages: JSONArray?, chapterUrl: String): List<MangaPage> {
+	private fun parsePages(pages: JSONArray?, chapterUrl: String, titleId: String): List<MangaPage> {
 		if (pages == null || pages.length() == 0) {
 			return emptyList()
 		}
 		return (0 until pages.length()).mapNotNull { i ->
 			val path = pages.optString(i).takeIf { it.isNotBlank() } ?: return@mapNotNull null
-			val imageUrl = resolvePageUrl(path)
+			val imageUrl = resolvePageUrl(path, titleId)
 			MangaPage(
 				id = generateUid("$chapterUrl#$i"),
 				url = imageUrl,
@@ -388,19 +388,12 @@ internal class TomiloLib(context: MangaLoaderContext) :
 			.toString()
 	}
 
-	private fun resolvePageUrl(path: String): String {
-		return (path.toUploadsChapterPath()
-			?.let {
-				"https://$domain$it".toHttpUrl().newBuilder()
-					.addQueryParameter("w", "3840")
-					.addQueryParameter("q", "85")
-					.build()
-					.toString()
-			}
+	private fun resolvePageUrl(path: String, titleId: String): String {
+		return (path.toUploadsChapterPath(titleId)?.toAbsoluteUrl(domain)
 			?: path.toAbsoluteUrl(domain)).toRelativeUrl(domain)
 	}
 
-	private fun String.toUploadsChapterPath(): String? {
+	private fun String.toUploadsChapterPath(titleId: String): String? {
 		val pagePath = if (startsWith("http://", ignoreCase = true) || startsWith("https://", ignoreCase = true)) {
 			toHttpUrl().encodedPath
 		} else {
@@ -412,15 +405,14 @@ internal class TomiloLib(context: MangaLoaderContext) :
 			return null
 		}
 		val chapterId = segments[chaptersIndex + 1]
-		val pageName = segments.last().substringBeforeLast('.', segments.last()) + ".webp"
-		return "/uploads/chapters/$chapterId/$pageName"
+		val pageName = segments.last()
+		return "/uploads/titles/$titleId/chapters/$chapterId/$pageName"
 	}
 
 	private fun HttpUrl.isImageUrl(): Boolean {
 		return when {
 			host == domain && encodedPath == "/_next/image" -> true
 			host == domain && encodedPath.startsWith("/uploads/titles/") -> true
-			host == domain && encodedPath.startsWith("/uploads/chapters/") -> true
 			host == "s3.regru.cloud" && encodedPath.startsWith("/tomilolib/titles/") -> true
 			else -> false
 		}

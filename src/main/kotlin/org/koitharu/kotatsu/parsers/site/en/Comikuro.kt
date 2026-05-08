@@ -315,10 +315,22 @@ internal class Comikuro(context: MangaLoaderContext) : PagedMangaParser(context,
 			}))();
 		""".trimIndent()
 		val rawHtml = context.evaluateJs(url, script, 30000L).orEmpty().decodeWebViewString()
+		logReturnedPageContent(url, rawHtml)
 		if (isCloudflareChallengePage(rawHtml)) {
 			requestCloudflareVerification(url)
 		}
 		return Jsoup.parse(rawHtml, url)
+	}
+
+	private fun logReturnedPageContent(url: String, html: String) {
+		println("COMIKURO_DEBUG: returned page url=$url length=${html.length}")
+		if (html.isEmpty()) {
+			println("COMIKURO_DEBUG: returned page content is empty")
+			return
+		}
+		html.chunked(LOG_CHUNK_SIZE).forEachIndexed { index, chunk ->
+			println("COMIKURO_DEBUG: returned page chunk=${index + 1} $chunk")
+		}
 	}
 
 	private fun requestCloudflareVerification(url: String): Nothing {
@@ -409,6 +421,8 @@ internal class Comikuro(context: MangaLoaderContext) : PagedMangaParser(context,
 
 		const val cloudflareMessage =
 			"Cloudflare verification is required. Open the source in the in-app browser, complete the check, then try again."
+
+		const val LOG_CHUNK_SIZE = 3500
 
 		val proxyHeaders = headersOf(
 			"Referer", "https://comikuro.to/",

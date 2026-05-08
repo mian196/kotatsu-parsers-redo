@@ -116,6 +116,10 @@ internal class ProjectSuki(context: MangaLoaderContext) :
 			val bookId = anchor.absUrl("href").toBookId() ?: return@forEach
 			val container = anchor.parents().firstOrNull { parent ->
 				parent.select("a[href]").any { it.absUrl("href").toBookId() == bookId } &&
+					parent.select("img").isNotEmpty() &&
+					parent.hasBookTitleLink(bookId)
+			} ?: anchor.parents().firstOrNull { parent ->
+				parent.select("a[href]").any { it.absUrl("href").toBookId() == bookId } &&
 					parent.select("img").isNotEmpty()
 			} ?: anchor
 			result.putIfAbsent(bookId, parseBookSummary(bookId, container, anchor, titles[bookId]))
@@ -146,6 +150,9 @@ internal class ProjectSuki(context: MangaLoaderContext) :
 
 	private fun parseBookSummary(bookId: String, container: Element, anchor: Element, apiTitle: String?): Manga {
 		val title = sequenceOf(
+			container.select(".details h4 a[href], h4 a[href]")
+				.firstOrNull { it.absUrl("href").toBookId() == bookId }
+				?.text(),
 			container.select("h1, h2, h3, h4, .title, [itemprop=name]").firstOrNull()?.text(),
 			container.select("a[href]")
 				.firstOrNull { it.absUrl("href").toBookId() == bookId && it.select("img").isEmpty() }
@@ -178,6 +185,11 @@ internal class ProjectSuki(context: MangaLoaderContext) :
 			authors = emptySet(),
 			source = source,
 		)
+	}
+
+	private fun Element.hasBookTitleLink(bookId: String): Boolean {
+		return select(".details h4 a[href], h1 a[href], h2 a[href], h3 a[href], h4 a[href]")
+			.any { it.absUrl("href").toBookId() == bookId && it.text().isValidBookTitle(bookId) }
 	}
 
 	private fun String?.isValidBookTitle(bookId: String): Boolean {
