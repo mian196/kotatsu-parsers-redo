@@ -12,6 +12,9 @@ import org.koitharu.kotatsu.parsers.core.PagedMangaParser
 import org.koitharu.kotatsu.parsers.exception.ParseException
 import org.koitharu.kotatsu.parsers.model.*
 import org.koitharu.kotatsu.parsers.util.*
+import org.koitharu.kotatsu.parsers.webview.InterceptionConfig
+import java.net.URLDecoder
+import java.nio.charset.StandardCharsets
 import java.util.*
 
 @MangaSourceParser("COMIX", "Comix", "en", ContentType.MANGA)
@@ -318,7 +321,7 @@ internal class Comix(context: MangaLoaderContext) :
         logDebug("webViewApiJson start path=$apiPath")
         return evaluateWebViewJson(
             label = apiPath,
-            script = buildWebViewApiScript("return JSON.stringify(fetchProtected(${apiPath.toJsString()}));"),
+            script = buildWebViewApiScript("return JSON.stringify(await fetchProtected(${apiPath.toJsString()}));"),
         )
     }
 
@@ -332,7 +335,7 @@ internal class Comix(context: MangaLoaderContext) :
                     const all = [];
                     let page = 1;
                     while (page <= $MAX_CHAPTER_API_PAGES) {
-                        const root = fetchProtected(${pathPrefix.toJsString()} + page);
+                        const root = await fetchProtected(${pathPrefix.toJsString()} + page);
                         const result = root && root.result ? root.result : root;
                         const items = result && Array.isArray(result.items) ? result.items : [];
                         if (page === 1 && !items.length) {
@@ -356,11 +359,32 @@ internal class Comix(context: MangaLoaderContext) :
     }
 
     private suspend fun evaluateWebViewJson(label: String, script: String): JSONObject {
-        logDebug("evaluateWebViewJson load base=https://$domain/ label=$label scriptLen=${script.length}")
-        val raw = context.evaluateJs("https://$domain/", script, WEBVIEW_API_TIMEOUT)
-        logDebug("evaluateWebViewJson raw label=$label len=${raw?.length ?: 0} excerpt=${raw.orEmpty().take(LOG_EXCERPT)}")
-        val decoded = raw.orEmpty()
-            .decodeWebViewString()
+        val bridgeScript = buildBridgeScript(script)
+        logDebug("evaluateWebViewJson intercept base=https://$domain/ label=$label scriptLen=${bridgeScript.length}")
+        val requests = runCatching {
+            context.interceptWebViewRequests(
+                "https://$domain/",
+                InterceptionConfig(
+                    timeoutMs = WEBVIEW_API_TIMEOUT,
+                    maxRequests = 1,
+                    urlPattern = INTERCEPT_URL_REGEX,
+                    pageScript = bridgeScript,
+                ),
+            )
+        }.getOrElse { e ->
+            throw ParseException("Comix WebView API interception failed", "https://$domain/", e)
+        }
+        val resultUrl = requests.firstOrNull()?.url
+            ?: throw ParseException("Comix WebView API did not return a bridge result", "https://$domain/")
+        logDebug("evaluateWebViewJson bridge label=$label url=${resultUrl.take(LOG_EXCERPT)}")
+        val decoded = when {
+            resultUrl.contains("/error?", ignoreCase = true) -> {
+                val message = resultUrl.queryParameterValue("msg") ?: "unknown WebView error"
+                throw ParseException("Comix WebView API failed: $message", "https://$domain/")
+            }
+            else -> resultUrl.queryParameterValue("data")
+                ?: throw ParseException("Comix WebView API bridge result missing data", "https://$domain/")
+        }
         logDebug("evaluateWebViewJson decoded label=$label len=${decoded.length} excerpt=${decoded.take(LOG_EXCERPT)}")
         if (decoded == CLOUDFLARE_BLOCKED || isCloudflarePage(decoded)) {
             logDebug("evaluateWebViewJson cloudflare label=$label")
@@ -382,6 +406,19 @@ internal class Comix(context: MangaLoaderContext) :
         return json
     }
 
+    private fun buildBridgeScript(script: String): String {
+        return """
+            (async function() {
+                try {
+                    const result = await $script;
+                    window.location.href = "$INTERCEPT_RESULT_URL?data=" + encodeURIComponent(String(result || ""));
+                } catch (e) {
+                    window.location.href = "$INTERCEPT_ERROR_URL?msg=" + encodeURIComponent(String((e && e.message) || e));
+                }
+            })();
+        """.trimIndent()
+    }
+
     private fun requestCloudflareVerification(url: String, cause: Throwable? = null): Nothing {
         try {
             context.requestBrowserAction(this, url)
@@ -392,9 +429,10 @@ internal class Comix(context: MangaLoaderContext) :
 
     private fun buildWebViewApiScript(body: String): String {
         return """
-            (() => {
+            (async () => {
                 const probePath = "/manga/g2rk/chapters";
                 const tokenRegex = /^[A-Za-z0-9_-]{40,200}$/;
+                const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
                 const challengeDetected = () => {
                     const root = document.documentElement;
                     const html = (root && root.outerHTML) || "";
@@ -460,8 +498,13 @@ internal class Comix(context: MangaLoaderContext) :
                 };
 
                 try {
-                    if (challengeDetected()) return "$CLOUDFLARE_BLOCKED";
-                    const glue = findGlue();
+                    let glue = null;
+                    for (let attempt = 0; attempt < 80; attempt++) {
+                        if (challengeDetected()) return "$CLOUDFLARE_BLOCKED";
+                        glue = findGlue();
+                        if (glue) break;
+                        await sleep(250);
+                    }
                     if (!glue) throw new Error("signer/decryptor not detected");
 
                     const captured = { res: glue.responseHandler || null };
@@ -476,36 +519,31 @@ internal class Comix(context: MangaLoaderContext) :
                         glue.installer(fakeAxios);
                     }
 
-                    const fetchProtected = (apiPath) => {
+                    const fetchProtected = async (apiPath) => {
                         const signablePath = apiPath.split("?")[0].replace(/^\/api\/v1/, "");
                         const sig = glue.signer(signablePath);
                         if (!sig) throw new Error("signer returned empty token");
                         const sep = apiPath.indexOf("?") === -1 ? "?" : "&";
                         const url = apiPath + sep + "_=" + encodeURIComponent(sig);
-                        const xhr = new XMLHttpRequest();
-                        xhr.open("GET", url, false);
-                        xhr.withCredentials = true;
-                        xhr.setRequestHeader("Accept", "application/json");
-                        xhr.setRequestHeader("X-Requested-With", "XMLHttpRequest");
-                        xhr.send(null);
-                        const text = xhr.responseText || "";
-                        if (xhr.status < 200 || xhr.status >= 300) {
-                            throw new Error("HTTP " + xhr.status + ": " + text.slice(0, 200));
+                        const resp = await fetch(url, {
+                            credentials: "include",
+                            headers: { "Accept": "application/json", "X-Requested-With": "XMLHttpRequest" }
+                        });
+                        const text = await resp.text();
+                        if (resp.status < 200 || resp.status >= 300) {
+                            throw new Error("HTTP " + resp.status + ": " + text.slice(0, 200));
                         }
                         const raw = JSON.parse(text);
                         if (raw && typeof raw === "object" && "e" in raw && captured.res) {
                             const fakeResp = {
                                 data: raw,
-                                status: xhr.status,
-                                statusText: xhr.statusText,
-                                headers: {},
+                                status: resp.status,
+                                statusText: resp.statusText,
+                                headers: Object.fromEntries([...resp.headers.entries()]),
                                 config: { url: url, method: "get", baseURL: "/api/v1" },
                                 request: {}
                             };
-                            const decoded = captured.res(fakeResp);
-                            if (decoded && typeof decoded.then === "function") {
-                                throw new Error("decryptor returned promise; async evaluateJs is unsupported");
-                            }
+                            const decoded = await captured.res(fakeResp);
                             return { result: decoded && decoded.data };
                         }
                         if (raw && typeof raw === "object" && "e" in raw) {
@@ -521,6 +559,17 @@ internal class Comix(context: MangaLoaderContext) :
                 }
             })();
         """.trimIndent()
+    }
+
+    private fun String.queryParameterValue(name: String): String? {
+        val query = substringAfter('?', "")
+        if (query.isEmpty()) return null
+        return query.split('&')
+            .asSequence()
+            .map { it.split('=', limit = 2) }
+            .firstOrNull { it.size == 2 && it[0] == name }
+            ?.get(1)
+            ?.let { URLDecoder.decode(it, StandardCharsets.UTF_8.name()) }
     }
 
     private fun String.toJsString(): String {
@@ -633,6 +682,9 @@ internal class Comix(context: MangaLoaderContext) :
         private const val MAX_CHAPTER_API_PAGES = 50
         private const val LOG_EXCERPT = 500
         private const val CLOUDFLARE_BLOCKED = "CLOUDFLARE_BLOCKED"
+        private const val INTERCEPT_RESULT_URL = "https://kotatsu.intercept/result"
+        private const val INTERCEPT_ERROR_URL = "https://kotatsu.intercept/error"
+        private val INTERCEPT_URL_REGEX = Regex("https://kotatsu\\.intercept/.*", RegexOption.IGNORE_CASE)
         private const val CLOUDFLARE_MESSAGE = "Cloudflare verification is required. Open Comix in the in-app browser, complete the check, then try again."
     }
 }
