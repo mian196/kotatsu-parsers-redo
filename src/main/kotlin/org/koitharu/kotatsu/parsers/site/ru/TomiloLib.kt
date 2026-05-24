@@ -179,14 +179,7 @@ internal class TomiloLib(context: MangaLoaderContext) :
 			?: throw ParseException("Cannot parse chapter id", chapter.url)
 		val titleId = url.queryParameter("titleId")?.takeIf { it.isNotEmpty() }
 			?: throw ParseException("Cannot parse title id", chapter.url)
-		val chapters = fetchChapterJson(titleId)
-		val chapterJson = (0 until chapters.length())
-			.asSequence()
-			.mapNotNull { chapters.optJSONObject(it) }
-			.firstOrNull { it.getStringOrNull("_id") == chapterId }
-			?: throw ParseException("Cannot find chapter pages", chapter.url)
-		return parsePages(chapterJson.optJSONArray("pages"), chapter.url, titleId)
-			.ifEmpty { fetchS3CoverPages(titleId, chapterId, chapter.url) }
+		return fetchS3CoverPages(titleId, chapterId, chapter.url)
 	}
 
 	private suspend fun fetchFilterOptions(): MangaListFilterOptions = MangaListFilterOptions(
@@ -235,8 +228,7 @@ internal class TomiloLib(context: MangaLoaderContext) :
 		val title = info.getStringOrNull("name") ?: slug
 		val url = "/titles/$slug"
 		val coverPath = info.getStringOrNull("coverImage")
-		val cover = coverPath?.let(::resolveCoverUrl)
-		val proxiedCover = coverPath?.let(::resolveNextImageCoverUrl)
+		val cover = coverPath?.let { resolveS3CoverUrl(it, id) }
 		val tags = LinkedHashSet<MangaTag>()
 		info.optJSONArray("genres")?.addStringsTo(tags)
 		info.optJSONArray("tags")?.addStringsTo(tags)
@@ -253,8 +245,8 @@ internal class TomiloLib(context: MangaLoaderContext) :
 			rating = info.optDouble("averageRating", 0.0).takeIf { it > 0.0 }?.div(10.0)?.toFloat()
 				?: RATING_UNKNOWN,
 			contentRating = parseContentRating(info),
-			coverUrl = cover ?: proxiedCover,
-			largeCoverUrl = proxiedCover ?: cover,
+			coverUrl = cover,
+			largeCoverUrl = cover,
 			tags = tags,
 			state = parseState(info.getStringOrNull("status")),
 			authors = authors,
@@ -432,6 +424,28 @@ internal class TomiloLib(context: MangaLoaderContext) :
 			.addQueryParameter("q", "85")
 			.build()
 			.toString()
+	}
+
+	private fun resolveS3CoverUrl(path: String, titleId: String): String {
+		val pathTitleId = when {
+			path.startsWith("http://", ignoreCase = true) || path.startsWith("https://", ignoreCase = true) -> {
+				path.toHttpUrlOrNull()
+					?.encodedPath
+					?.trim('/')
+					?.split('/')
+					?.let { segments ->
+						segments.indexOf("titles")
+							.takeIf { it >= 0 && it + 1 < segments.size }
+							?.let { segments[it + 1] }
+					}
+			}
+			else -> path.trim('/').split('/').let { segments ->
+				segments.indexOf("titles")
+					.takeIf { it >= 0 && it + 1 < segments.size }
+					?.let { segments[it + 1] }
+			}
+		}
+		return "$CDN_URL/titles/${pathTitleId ?: titleId}/cover.jpeg"
 	}
 
 	private fun resolvePageUrl(path: String, titleId: String): String {
