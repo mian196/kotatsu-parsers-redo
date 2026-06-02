@@ -1,10 +1,8 @@
 package org.koitharu.kotatsu.parsers.site.all
 
 import okhttp3.Interceptor
-import okhttp3.MediaType.Companion.toMediaType
-import okhttp3.Protocol
+import okhttp3.HttpUrl.Companion.toHttpUrl
 import okhttp3.Request
-import okhttp3.RequestBody.Companion.toRequestBody
 import okhttp3.Response
 import okhttp3.ResponseBody.Companion.toResponseBody
 import org.json.JSONArray
@@ -15,7 +13,6 @@ import org.koitharu.kotatsu.parsers.config.ConfigKey
 import org.koitharu.kotatsu.parsers.core.PagedMangaParser
 import org.koitharu.kotatsu.parsers.model.*
 import org.koitharu.kotatsu.parsers.util.*
-import org.koitharu.kotatsu.parsers.webview.InterceptedRequest
 import org.koitharu.kotatsu.parsers.webview.InterceptionConfig
 import java.math.BigInteger
 import java.net.URI
@@ -139,25 +136,12 @@ internal class Kagane(context: MangaLoaderContext) :
             jsonBody.put("genres", genresObj)
         }
 
-        val requestBody = jsonBody.toString().toRequestBody("application/json".toMediaType())
-
         val headers = getRequestHeaders().newBuilder()
             .add("Origin", "https://$domain")
             .add("Referer", "https://$domain/")
             .build()
 
-        val responseObj = context.httpClient.newCall(
-            Request.Builder()
-                .url(url)
-                .post(requestBody)
-                .headers(headers)
-                .build()
-        ).await()
-
-        val responseBody = responseObj.body?.string() ?: ""
-        if (!responseObj.isSuccessful) {
-            throw Exception("Search error ${responseObj.code}: $responseBody")
-        }
+        val responseBody = webClient.httpPost(url.toHttpUrl(), jsonBody, headers).parseRaw()
 
         val response = try {
             JSONObject(responseBody)
@@ -490,19 +474,7 @@ internal class Kagane(context: MangaLoaderContext) :
             .add("x-integrity-token", integrityToken)
             .build()
 
-        val response = context.httpClient.newCall(
-            Request.Builder()
-                .url(challengeUrl)
-                .post(jsonBody.toString().toRequestBody("application/json".toMediaType()))
-                .headers(headers)
-                .build()
-        ).await()
-
-        val responseBody = response.body?.string() ?: ""
-
-        if (!response.isSuccessful) {
-            throw Exception("Failed to get token: ${response.code} $responseBody")
-        }
+        val responseBody = webClient.httpPost(challengeUrl.toHttpUrl(), jsonBody, headers).parseRaw()
 
         val tokenResponse = try {
             JSONObject(responseBody)
@@ -523,18 +495,15 @@ internal class Kagane(context: MangaLoaderContext) :
 
         val pagesJson = tokenResponse.optJSONArray("pages")
         if (pagesJson != null && pagesJson.length() > 0) {
-            return (0 until pagesJson.length()).mapNotNull { index ->
+            val pages = (0 until pagesJson.length()).mapNotNull { index ->
                 val pageEntry = pagesJson.opt(index)
-                val pageUuid = when (pageEntry) {
-                    is String -> pageEntry
-                    is JSONObject -> pageEntry.optString("pageUuid").ifBlank {
-                        pageEntry.optString("page_uuid")
-                    }
-                    else -> ""
-                }
+                val pageUuid = pageEntry.toPageFileId()
                 if (pageUuid.isBlank()) return@mapNotNull null
                 val pageIndex = when (pageEntry) {
-                    is JSONObject -> pageEntry.optInt("pageNumber", pageEntry.optInt("page_number", index + 1))
+                    is JSONObject -> pageEntry.optInt(
+                        "pageNumber",
+                        pageEntry.optInt("page_number", pageEntry.optInt("index", index + 1)),
+                    )
                     else -> index + 1
                 }
                 val imageUrl = "$currentCacheUrl/api/v2/books/file/$chapterId/$pageUuid?token=$token&is_datasaver=false&sid=$seriesId&index=$pageIndex"
@@ -545,13 +514,21 @@ internal class Kagane(context: MangaLoaderContext) :
                     source = source,
                 )
             }
+            if (pages.isNotEmpty()) {
+                return pages
+            }
         }
 
         val mappingJson = tokenResponse.optJSONObject("page_mapping")
+            ?: tokenResponse.optJSONObject("pageMapping")
+            ?: tokenResponse.optJSONObject("file_mapping")
+            ?: tokenResponse.optJSONObject("fileMapping")
+            ?: tokenResponse.optJSONObject("files")
         val mapping = mutableMapOf<Int, String>()
         mappingJson?.keys()?.forEach { key ->
             val idx = key.toIntOrNull()
-            if (idx != null) mapping[idx] = mappingJson.getString(key)
+            val fileId = mappingJson.opt(key).toPageFileId()
+            if (idx != null && fileId.isNotBlank()) mapping[idx] = fileId
         }
         val totalPages = if (pageCount > 0) pageCount else mapping.size
         if (totalPages <= 0) {
@@ -559,7 +536,9 @@ internal class Kagane(context: MangaLoaderContext) :
         }
         return (0 until totalPages).map { index ->
             val pageIndex = index + 1
-            val fileId = mapping[pageIndex] ?: "page_$pageIndex.jpg"
+            val fileId = mapping[pageIndex]
+                ?: mapping[index]
+                ?: "%04d.jpg".format(pageIndex)
             val imageUrl = "$currentCacheUrl/api/v2/books/file/$chapterId/$fileId?token=$token&is_datasaver=false&sid=$seriesId&index=$pageIndex"
             MangaPage(
                 id = generateUid(imageUrl),
@@ -583,6 +562,7 @@ internal class Kagane(context: MangaLoaderContext) :
         val req = Request.Builder().url(url)
             .addHeader("Origin", "https://$domain")
             .addHeader("Referer", "https://$domain/")
+            .tag(MangaSource::class.java, source)
             .build()
 
         val response = runCatching {
@@ -645,6 +625,36 @@ internal class Kagane(context: MangaLoaderContext) :
     private fun String.toChapterNumberOrNull(): Float? = trim()
         .replace(',', '.')
         .toFloatOrNull()
+
+    private fun Any?.toPageFileId(): String = when (this) {
+        is String -> toFileNamePart()
+        is JSONObject -> optFirstString(
+            "pageUuid",
+            "page_uuid",
+            "pageId",
+            "page_id",
+            "fileId",
+            "file_id",
+            "fileName",
+            "file_name",
+            "filename",
+            "name",
+            "id",
+            "path",
+            "url",
+        ).toFileNamePart()
+        else -> ""
+    }
+
+    private fun JSONObject.optFirstString(vararg keys: String): String {
+        for (key in keys) {
+            val value = optString(key).trim()
+            if (value.isNotEmpty()) return value
+        }
+        return ""
+    }
+
+    private fun String.toFileNamePart(): String = substringBefore('?').substringAfterLast('/').trim()
 
     private operator fun ByteArray.plus(other: ByteArray): ByteArray {
         val result = ByteArray(this.size + other.size)
