@@ -222,9 +222,6 @@ internal class Comix(context: MangaLoaderContext) :
 
     override suspend fun getPages(chapter: MangaChapter): List<MangaPage> {
         val chapterId = chapter.url.substringAfterLast("/").substringBefore("-")
-        // Load the reader page and let the site's own (signed) request fetch the
-        // pages; we hook JSON.parse to capture the parsed payload. No signing on
-        // our side — the site does it.
         val response = captureJsonViaWebView(chapter.url.toAbsoluteUrl(domain), PAGES_HOOK_SCRIPT)
         val pagesRoot = response.optJSONObject("result")?.optJSONObject("pages")
         val baseUrl = pagesRoot?.optString("baseUrl").orEmpty().trimEnd('/')
@@ -313,8 +310,6 @@ internal class Comix(context: MangaLoaderContext) :
 
     private suspend fun getChapters(manga: Manga): List<MangaChapter> {
         val hashId = manga.url.substringAfter("/title/")
-        // Load the manga page; the site fetches its (signed) chapters API and we
-        // hook JSON.parse to capture the items, paginating via the "Next" button.
         val response = captureJsonViaWebView(manga.url.toAbsoluteUrl(domain), CHAPTERS_HOOK_SCRIPT)
         val allChapters = response.optJSONArray("items") ?: JSONArray()
         val chaptersBuilder = ChaptersListBuilder(allChapters.length())
@@ -393,22 +388,72 @@ internal class Comix(context: MangaLoaderContext) :
         }
         val decoded = resultUrl.queryParameterValue("data")
             ?: throw ParseException("Comix WebView bridge result missing data", pageUrl)
-        if (decoded.isBlank() || isCloudflarePage(decoded)) {
+        if (decoded == CLOUDFLARE_BLOCKED || isCloudflarePage(decoded)) {
             requestCloudflareVerification(pageUrl)
         }
-        return runCatching { JSONObject(decoded) }.getOrElse { e ->
+        if (decoded.isBlank()) {
+            throw ParseException("Comix WebView returned an empty response", pageUrl)
+        }
+        val json = runCatching { JSONObject(decoded) }.getOrElse { e ->
             throw ParseException("Comix WebView returned invalid JSON: ${decoded.take(200)}", pageUrl, e)
         }
+        json.optString("error").nullIfEmpty()?.let { error ->
+            throw ParseException("Comix WebView failed: $error", pageUrl)
+        }
+        return json
     }
 
     private fun buildBridgeScript(hookExpression: String): String {
         return """
             (async function() {
+                const resultUrl = "$INTERCEPT_RESULT_URL#data=";
+                const errorUrl = "$INTERCEPT_ERROR_URL#msg=";
+                const submitResult = function (data) {
+                    window.location.href = resultUrl + encodeURIComponent(String(data || ""));
+                };
+                const submitError = function (e) {
+                    window.location.href = errorUrl + encodeURIComponent(String((e && e.message) || e));
+                };
+                const challengeDetected = function () {
+                    const root = document.documentElement;
+                    const html = (root && root.outerHTML) || "";
+                    const text = ((document.body && document.body.innerText) || (root && root.innerText) || "");
+                    const lower = (document.title + "\n" + text + "\n" + html).toLowerCase();
+                    return document.querySelector('script[src*="challenge-platform"]') !== null ||
+                        document.querySelector('script[src*="turnstile"]') !== null ||
+                        document.querySelector('iframe[src*="challenges.cloudflare.com"]') !== null ||
+                        document.querySelector('.cf-turnstile') !== null ||
+                        document.querySelector('form[action*="__cf_chl"]') !== null ||
+                        document.querySelector('.cf-browser-verification') !== null ||
+                        ((lower.includes('just a moment') || lower.includes('checking your browser')) && lower.includes('cloudflare')) ||
+                        lower.includes('challenge-platform') ||
+                        lower.includes('challenges.cloudflare.com') ||
+                        lower.includes('cf-turnstile') ||
+                        lower.includes('turnstile') ||
+                        lower.includes('cf-chl-opt') ||
+                        lower.includes("we're maintaining the site");
+                };
+                const challenge = new Promise(function (resolve) {
+                    let tries = 0;
+                    const iv = setInterval(function () {
+                        if (challengeDetected()) {
+                            clearInterval(iv);
+                            resolve("$CLOUDFLARE_BLOCKED");
+                        } else if (++tries > 320) {
+                            clearInterval(iv);
+                        }
+                    }, 250);
+                });
+                const timeout = new Promise(function (_, reject) {
+                    setTimeout(function () {
+                        reject(new Error("Comix WebView bridge timed out"));
+                    }, $WEBVIEW_BRIDGE_TIMEOUT);
+                });
                 try {
-                    const result = await ($hookExpression);
-                    window.location.href = "$INTERCEPT_RESULT_URL#data=" + encodeURIComponent(String(result || ""));
+                    const result = await Promise.race([($hookExpression), challenge, timeout]);
+                    submitResult(result);
                 } catch (e) {
-                    window.location.href = "$INTERCEPT_ERROR_URL#msg=" + encodeURIComponent(String((e && e.message) || e));
+                    submitError(e);
                 }
             })();
         """.trimIndent()
@@ -550,6 +595,8 @@ internal class Comix(context: MangaLoaderContext) :
         private const val LCG_INCREMENT = 1013904223
         private val RELATIVE_DATE_REGEX = Regex("""^(\d+)\s*(s|m|h|d|w|mo|mos|y|yr|yrs|min|mins|sec|secs|hr|hrs|day|days|week|weeks|month|months|year|years)$""")
         private const val WEBVIEW_API_TIMEOUT = 90000L
+        private const val WEBVIEW_BRIDGE_TIMEOUT = 85000L
+        private const val CLOUDFLARE_BLOCKED = "CLOUDFLARE_BLOCKED"
         private const val INTERCEPT_RESULT_URL = "https://kotatsu.intercept/result"
         private const val INTERCEPT_ERROR_URL = "https://kotatsu.intercept/error"
         private val INTERCEPT_URL_REGEX = Regex("https://kotatsu\\.intercept/.*", RegexOption.IGNORE_CASE)
@@ -575,9 +622,8 @@ internal class Comix(context: MangaLoaderContext) :
             })
         """.trimIndent()
 
-        // Hook for the manga page: bump the chapters page size to 100, accumulate
-        // every page the site loads, and click "Next" until exhausted, then resolve
-        // with { items: [...] }.
+        // Hook for the manga page: bump the chapters page size to 100, pick one
+        // scanlation group from the first payload, and return only that group.
         private val CHAPTERS_HOOK_SCRIPT = """
             new Promise(function (resolve) {
                 const rewriteUrl = function (url) {
@@ -594,11 +640,42 @@ internal class Comix(context: MangaLoaderContext) :
                 const originalParse = JSON.parse;
                 const seen = new Set();
                 const items = [];
+                let selectedTeamKey = null;
                 let submitted = false;
+                const teamKeyOf = function (item) {
+                    const group = item && (item.group || item.scanlation_group);
+                    if (group && group.id !== undefined && group.id !== null) {
+                        return 'group:' + String(group.id);
+                    }
+                    if (item && item.isOfficial) {
+                        return 'official';
+                    }
+                    return '';
+                };
+                const mostActiveTeamKey = function (list) {
+                    const counts = new Map();
+                    for (const item of list) {
+                        const key = teamKeyOf(item);
+                        if (!key) continue;
+                        counts.set(key, (counts.get(key) || 0) + 1);
+                    }
+                    let best = '';
+                    let bestCount = 0;
+                    for (const [key, count] of counts) {
+                        if (count > bestCount) {
+                            best = key;
+                            bestCount = count;
+                        }
+                    }
+                    return best;
+                };
                 const submit = function () {
                     if (submitted) return;
                     submitted = true;
-                    resolve(JSON.stringify({ items: items }));
+                    const selected = selectedTeamKey ? items.filter(function (item) {
+                        return teamKeyOf(item) === selectedTeamKey;
+                    }) : items;
+                    resolve(JSON.stringify({ items: selected }));
                 };
                 JSON.parse = new Proxy(originalParse, {
                     apply(target, thisArg, args) {
@@ -614,6 +691,9 @@ internal class Comix(context: MangaLoaderContext) :
                                 const page = (meta && meta.page) || 1;
                                 if (!seen.has(page)) {
                                     seen.add(page);
+                                    if (selectedTeamKey === null) {
+                                        selectedTeamKey = mostActiveTeamKey(parsed.result.items);
+                                    }
                                     for (const it of parsed.result.items) items.push(it);
                                     if (meta && meta.hasNext) {
                                         let tries = 0;
