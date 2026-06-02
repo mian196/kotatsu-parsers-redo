@@ -273,7 +273,7 @@ internal abstract class InitMangaParser(
 				"${mangaUrl.toAbsoluteUrl(domain).trimEnd('/')}/bolum/page/$page/"
 			}
 			val doc = webClient.httpGet(url).parseHtml()
-			val items = doc.select(selectChapterItems)
+			val items = doc.selectChapterItems(mangaUrl)
 			if (items.isEmpty()) {
 				break
 			}
@@ -300,6 +300,34 @@ internal abstract class InitMangaParser(
 	}
 
 	protected open val selectChapterItems = "div.chapter-item, div#chapters-list > a[href], #chapters-list > li > a[href]"
+
+	private fun Document.selectChapterItems(mangaUrl: String): List<Element> {
+		val items = select(selectChapterItems)
+		if (items.isNotEmpty()) {
+			return items
+		}
+
+		val mangaPath = mangaUrl.toAbsoluteUrl(domain)
+			.toHttpUrlOrNull()
+			?.encodedPath
+			?.trimEnd('/')
+			?: return emptyList()
+		return select("a[href]").filter { anchor ->
+			val chapterPath = anchor.attrAsAbsoluteUrlOrNull("href")
+				?.toHttpUrlOrNull()
+				?.encodedPath
+				?.trimEnd('/')
+				?: return@filter false
+			if (!chapterPath.startsWith("$mangaPath/")) return@filter false
+
+			val chapterSlug = chapterPath.removePrefix(mangaPath).trim('/')
+			chapterSlug.isNotEmpty() &&
+				!chapterSlug.startsWith("bolum/page/") &&
+				CHAPTER_NUMBER_REGEX.containsMatchIn(chapterSlug)
+		}.distinctBy { anchor ->
+			anchor.attrAsRelativeUrlOrNull("href") ?: anchor.attr("href")
+		}
+	}
 
 	private fun parseChapter(element: Element): MangaChapter? {
 		val a = element.takeIf { it.tagName() == "a" && it.hasAttr("href") }
