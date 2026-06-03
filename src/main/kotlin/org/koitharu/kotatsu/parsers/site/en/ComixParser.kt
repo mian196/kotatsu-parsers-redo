@@ -310,8 +310,7 @@ internal class Comix(context: MangaLoaderContext) :
 
     private suspend fun getChapters(manga: Manga): List<MangaChapter> {
         val hashId = manga.url.substringAfter("/title/")
-        val response = captureJsonViaWebView(manga.url.toAbsoluteUrl(domain), CHAPTERS_HOOK_SCRIPT)
-        val allChapters = response.optJSONArray("items") ?: JSONArray()
+        val allChapters = loadAllChapters(hashId, manga.url.toAbsoluteUrl(domain))
         val chaptersBuilder = ChaptersListBuilder(allChapters.length())
         for (i in 0 until allChapters.length()) {
             val chapterData = allChapters.getJSONObject(i)
@@ -342,6 +341,49 @@ internal class Comix(context: MangaLoaderContext) :
         }
 
         return chaptersBuilder.toList().reversed()
+    }
+
+    private suspend fun loadAllChapters(hashId: String, pageUrl: String): JSONArray {
+        val apiPath = "/api/v1/manga/$hashId/chapters"
+        val response = evaluateWebViewApiJson(
+            pageUrl = pageUrl,
+            script = buildWebViewApiScript(
+                """
+                    const basePath = ${apiPath.toJsString()};
+                    const limit = 100;
+                    const items = [];
+                    const seen = new Set();
+                    for (let page = 1; page <= 200; page++) {
+                        const payload = await fetchProtected(basePath + "?limit=" + limit + "&page=" + page);
+                        const result = payload && payload.result ? payload.result : payload;
+                        const pageItems = Array.isArray(result && result.items) ? result.items : [];
+                        const meta = (result && (result.meta || result.pagination)) || {};
+                        const currentPage = Number((meta && (meta.page || meta.currentPage)) || page);
+                        const pageKey = pageItems.length > 0 ?
+                            String(pageItems[0].id) + ":" + String(pageItems[pageItems.length - 1].id) :
+                            "empty:" + page;
+                        if (seen.has(pageKey)) break;
+                        seen.add(pageKey);
+                        for (const item of pageItems) items.push(item);
+
+                        const hasNext = meta && (meta.hasNext === true || meta.hasNext === "true" ||
+                            meta.hasNext === 1 || meta.hasNext === "1");
+                        const hasNextFalse = meta && (meta.hasNext === false || meta.hasNext === "false" ||
+                            meta.hasNext === 0 || meta.hasNext === "0");
+                        const lastPage = Number(meta && (meta.lastPage || meta.totalPages || meta.pages ||
+                            meta.pageCount || meta.last_page || meta.total_pages));
+                        if (pageItems.length === 0 || hasNextFalse || (lastPage && currentPage >= lastPage)) {
+                            break;
+                        }
+                        if (!hasNext && pageItems.length < limit) {
+                            break;
+                        }
+                    }
+                    return JSON.stringify({ items: items });
+                """.trimIndent(),
+            ),
+        )
+        return response.optJSONArray("items") ?: JSONArray()
     }
 
     private fun apiUrl(path: String): String = "https://$domain/api/v1/${path.removePrefix("/")}"
@@ -404,106 +446,6 @@ internal class Comix(context: MangaLoaderContext) :
             throw ParseException("Comix WebView API failed: $error", pageUrl)
         }
         return json
-    }
-
-    /**
-     * Loads [pageUrl] in a WebView and runs [hookExpression] — a JS expression
-     * evaluating to a Promise that resolves with a JSON string once the desired
-     * payload passes through the site's `JSON.parse`. The result is exfiltrated
-     * by navigating to an intercept URL whose request we capture.
-     */
-    private suspend fun captureJsonViaWebView(pageUrl: String, hookExpression: String): JSONObject {
-        val bridgeScript = buildBridgeScript(hookExpression)
-        val requests = runCatching {
-            context.interceptWebViewRequests(
-                pageUrl,
-                InterceptionConfig(
-                    timeoutMs = WEBVIEW_API_TIMEOUT,
-                    maxRequests = 1,
-                    urlPattern = INTERCEPT_URL_REGEX,
-                    pageScript = bridgeScript,
-                ),
-            )
-        }.getOrElse { e ->
-            throw ParseException("Comix WebView interception failed", pageUrl, e)
-        }
-        val resultUrl = requests.firstOrNull()?.url
-            ?: throw ParseException("Comix WebView did not return a result", pageUrl)
-        if (resultUrl.contains("/error", ignoreCase = true)) {
-            val message = resultUrl.queryParameterValue("msg") ?: "unknown WebView error"
-            throw ParseException("Comix WebView failed: $message", pageUrl)
-        }
-        val decoded = resultUrl.queryParameterValue("data")
-            ?: throw ParseException("Comix WebView bridge result missing data", pageUrl)
-        if (decoded == CLOUDFLARE_BLOCKED || isCloudflarePage(decoded)) {
-            requestCloudflareVerification(pageUrl)
-        }
-        if (decoded.isBlank()) {
-            throw ParseException("Comix WebView returned an empty response", pageUrl)
-        }
-        val json = runCatching { JSONObject(decoded) }.getOrElse { e ->
-            throw ParseException("Comix WebView returned invalid JSON: ${decoded.take(200)}", pageUrl, e)
-        }
-        json.optString("error").nullIfEmpty()?.let { error ->
-            throw ParseException("Comix WebView failed: $error", pageUrl)
-        }
-        return json
-    }
-
-    private fun buildBridgeScript(hookExpression: String): String {
-        return """
-            (async function() {
-                const resultUrl = "$INTERCEPT_RESULT_URL#data=";
-                const errorUrl = "$INTERCEPT_ERROR_URL#msg=";
-                const submitResult = function (data) {
-                    window.location.href = resultUrl + encodeURIComponent(String(data || ""));
-                };
-                const submitError = function (e) {
-                    window.location.href = errorUrl + encodeURIComponent(String((e && e.message) || e));
-                };
-                const challengeDetected = function () {
-                    const root = document.documentElement;
-                    const html = (root && root.outerHTML) || "";
-                    const text = ((document.body && document.body.innerText) || (root && root.innerText) || "");
-                    const lower = (document.title + "\n" + text + "\n" + html).toLowerCase();
-                    return document.querySelector('script[src*="challenge-platform"]') !== null ||
-                        document.querySelector('script[src*="turnstile"]') !== null ||
-                        document.querySelector('iframe[src*="challenges.cloudflare.com"]') !== null ||
-                        document.querySelector('.cf-turnstile') !== null ||
-                        document.querySelector('form[action*="__cf_chl"]') !== null ||
-                        document.querySelector('.cf-browser-verification') !== null ||
-                        ((lower.includes('just a moment') || lower.includes('checking your browser')) && lower.includes('cloudflare')) ||
-                        lower.includes('challenge-platform') ||
-                        lower.includes('challenges.cloudflare.com') ||
-                        lower.includes('cf-turnstile') ||
-                        lower.includes('turnstile') ||
-                        lower.includes('cf-chl-opt') ||
-                        lower.includes("we're maintaining the site");
-                };
-                const challenge = new Promise(function (resolve) {
-                    let tries = 0;
-                    const iv = setInterval(function () {
-                        if (challengeDetected()) {
-                            clearInterval(iv);
-                            resolve("$CLOUDFLARE_BLOCKED");
-                        } else if (++tries > 320) {
-                            clearInterval(iv);
-                        }
-                    }, 250);
-                });
-                const timeout = new Promise(function (_, reject) {
-                    setTimeout(function () {
-                        reject(new Error("Comix WebView bridge timed out"));
-                    }, $WEBVIEW_BRIDGE_TIMEOUT);
-                });
-                try {
-                    const result = await Promise.race([($hookExpression), challenge, timeout]);
-                    submitResult(result);
-                } catch (e) {
-                    submitError(e);
-                }
-            })();
-        """.trimIndent()
     }
 
     private fun buildWebViewApiBridgeScript(script: String): String {
@@ -821,76 +763,11 @@ internal class Comix(context: MangaLoaderContext) :
         private const val LCG_INCREMENT = 1013904223
         private val RELATIVE_DATE_REGEX = Regex("""^(\d+)\s*(s|m|h|d|w|mo|mos|y|yr|yrs|min|mins|sec|secs|hr|hrs|day|days|week|weeks|month|months|year|years)$""")
         private const val WEBVIEW_API_TIMEOUT = 90000L
-        private const val WEBVIEW_BRIDGE_TIMEOUT = 85000L
         private const val CLOUDFLARE_BLOCKED = "CLOUDFLARE_BLOCKED"
         private const val INTERCEPT_RESULT_URL = "https://kotatsu.intercept/result"
         private const val INTERCEPT_ERROR_URL = "https://kotatsu.intercept/error"
         private val INTERCEPT_URL_REGEX = Regex("https://kotatsu\\.intercept/.*", RegexOption.IGNORE_CASE)
         private const val CLOUDFLARE_MESSAGE =
             "Cloudflare verification is required. Open Comix in the in-app browser, complete the check, then try again."
-
-        // Hook for the manga page: bump the chapters page size to 100 and collect
-        // every loaded chapter item. Kotlin assigns each scanlation group to a
-        // separate branch so alternate teams stay available.
-        private val CHAPTERS_HOOK_SCRIPT = """
-            new Promise(function (resolve) {
-                const rewriteUrl = function (url) {
-                    if (typeof url === 'string' && url.indexOf('/chapters') !== -1 && /[?&]limit=\d+/.test(url)) {
-                        return url.replace(/([?&]limit=)\d+/, '${'$'}1100');
-                    }
-                    return url;
-                };
-                const originalOpen = XMLHttpRequest.prototype.open;
-                XMLHttpRequest.prototype.open = function (method, url) {
-                    arguments[1] = rewriteUrl(url);
-                    return originalOpen.apply(this, arguments);
-                };
-                const originalParse = JSON.parse;
-                const seen = new Set();
-                const items = [];
-                let submitted = false;
-                const submit = function () {
-                    if (submitted) return;
-                    submitted = true;
-                    resolve(JSON.stringify({ items: items }));
-                };
-                JSON.parse = new Proxy(originalParse, {
-                    apply(target, thisArg, args) {
-                        const parsed = Reflect.apply(target, thisArg, args);
-                        try {
-                            if (!submitted && parsed && parsed.result &&
-                                Array.isArray(parsed.result.items) &&
-                                parsed.result.items.length > 0 &&
-                                parsed.result.items[0] &&
-                                parsed.result.items[0].id !== undefined &&
-                                parsed.result.items[0].mangaId !== undefined) {
-                                const meta = parsed.result.meta || parsed.result.pagination;
-                                const page = (meta && meta.page) || 1;
-                                if (!seen.has(page)) {
-                                    seen.add(page);
-                                    for (const it of parsed.result.items) items.push(it);
-                                    if (meta && meta.hasNext) {
-                                        let tries = 0;
-                                        const iv = setInterval(function () {
-                                            const btn = document.querySelector('.mchap-foot button[aria-label*=Next]');
-                                            if (btn && !btn.disabled) {
-                                                btn.click();
-                                                clearInterval(iv);
-                                            } else if (++tries > 50) {
-                                                clearInterval(iv);
-                                                submit();
-                                            }
-                                        }, 100);
-                                    } else {
-                                        submit();
-                                    }
-                                }
-                            }
-                        } catch (e) {}
-                        return parsed;
-                    }
-                });
-            })
-        """.trimIndent()
     }
 }
