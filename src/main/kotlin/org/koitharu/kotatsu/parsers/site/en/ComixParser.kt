@@ -829,10 +829,8 @@ internal class Comix(context: MangaLoaderContext) :
         private const val CLOUDFLARE_MESSAGE =
             "Cloudflare verification is required. Open Comix in the in-app browser, complete the check, then try again."
 
-        // Hook for the manga page: bump the chapters page size to 100, collect
-        // every loaded page, then return the best single scanlation group. The
-        // selected team is remembered per manga in WebView storage and rechecked
-        // on each load so stale partial runs can be replaced.
+        // Hook for the manga page: bump the chapters page size to 100, pick one
+        // scanlation group from the first payload, and return only that group.
         private val CHAPTERS_HOOK_SCRIPT = """
             new Promise(function (resolve) {
                 const rewriteUrl = function (url) {
@@ -849,6 +847,7 @@ internal class Comix(context: MangaLoaderContext) :
                 const originalParse = JSON.parse;
                 const seen = new Set();
                 const items = [];
+                let selectedTeamKey = null;
                 let submitted = false;
                 const teamKeyOf = function (item) {
                     const group = item && (item.group || item.scanlation_group);
@@ -860,105 +859,26 @@ internal class Comix(context: MangaLoaderContext) :
                     }
                     return '';
                 };
-                const chapterNumberOf = function (item) {
-                    const n = Number(item && item.number);
-                    return Number.isFinite(n) ? n : null;
-                };
-                const storedTeamKey = function (mangaId) {
-                    try {
-                        return window.localStorage.getItem('kotatsu:comix:team:' + String(mangaId)) || '';
-                    } catch (e) {
-                        return '';
-                    }
-                };
-                const rememberTeamKey = function (mangaId, key) {
-                    if (!mangaId || !key) return;
-                    try {
-                        window.localStorage.setItem('kotatsu:comix:team:' + String(mangaId), key);
-                    } catch (e) {}
-                };
-                const buildTeamStats = function (list) {
-                    const allNumberSet = new Set();
-                    for (const item of list) {
-                        const n = chapterNumberOf(item);
-                        if (n !== null) allNumberSet.add(String(n));
-                    }
-                    const allNumbers = Array.from(allNumberSet).map(Number).sort(function (a, b) { return a - b; });
-                    const indexes = new Map();
-                    allNumbers.forEach(function (n, i) {
-                        indexes.set(String(n), i);
-                    });
-                    const byTeam = new Map();
+                const mostActiveTeamKey = function (list) {
+                    const counts = new Map();
                     for (const item of list) {
                         const key = teamKeyOf(item);
                         if (!key) continue;
-                        let team = byTeam.get(key);
-                        if (!team) {
-                            team = { key: key, items: [], numbers: new Set() };
-                            byTeam.set(key, team);
-                        }
-                        team.items.push(item);
-                        const n = chapterNumberOf(item);
-                        if (n !== null) team.numbers.add(String(n));
+                        counts.set(key, (counts.get(key) || 0) + 1);
                     }
-                    const result = new Map();
-                    for (const [key, team] of byTeam) {
-                        const indexesForTeam = Array.from(team.numbers)
-                            .map(function (n) { return indexes.get(n); })
-                            .filter(function (idx) { return idx !== undefined; })
-                            .sort(function (a, b) { return a - b; });
-                        const count = indexesForTeam.length;
-                        const minIndex = count > 0 ? indexesForTeam[0] : -1;
-                        const maxIndex = count > 0 ? indexesForTeam[count - 1] : -1;
-                        const span = count > 0 ? maxIndex - minIndex + 1 : 0;
-                        const coverage = allNumbers.length > 0 ? count / allNumbers.length : 1;
-                        const consistency = span > 0 ? count / span : 1;
-                        const touchesStart = minIndex === 0;
-                        const touchesEnd = maxIndex === allNumbers.length - 1;
-                        const edgeOnly = allNumbers.length > 6 && count < allNumbers.length &&
-                            touchesStart !== touchesEnd && coverage < 0.8;
-                        const sparse = count > 3 && consistency < 0.7 && (span - count) > 2;
-                        const usable = allNumbers.length <= 6 || (!edgeOnly && !sparse);
-                        const fullSpan = touchesStart && touchesEnd;
-                        const score = coverage * 1000 + consistency * 300 +
-                            Math.log(count + 1) * 20 + (fullSpan ? 200 : 0) -
-                            (edgeOnly ? 250 : 0) - (sparse ? 300 : 0);
-                        result.set(key, {
-                            items: team.items,
-                            usable: usable,
-                            score: score,
-                            count: count
-                        });
-                    }
-                    return result;
-                };
-                const chooseTeamKey = function (list) {
-                    if (list.length === 0) return '';
-                    const mangaId = list[0] && list[0].mangaId;
-                    const teams = buildTeamStats(list);
-                    const remembered = storedTeamKey(mangaId);
-                    const rememberedTeam = teams.get(remembered);
-                    if (rememberedTeam && rememberedTeam.usable) {
-                        return remembered;
-                    }
-                    let bestKey = '';
-                    let best = null;
-                    for (const [key, team] of teams) {
-                        if (!best ||
-                            (team.usable && !best.usable) ||
-                            (team.usable === best.usable && team.score > best.score) ||
-                            (team.usable === best.usable && team.score === best.score && team.count > best.count)) {
-                            bestKey = key;
-                            best = team;
+                    let best = '';
+                    let bestCount = 0;
+                    for (const [key, count] of counts) {
+                        if (count > bestCount) {
+                            best = key;
+                            bestCount = count;
                         }
                     }
-                    rememberTeamKey(mangaId, bestKey);
-                    return bestKey;
+                    return best;
                 };
                 const submit = function () {
                     if (submitted) return;
                     submitted = true;
-                    const selectedTeamKey = chooseTeamKey(items);
                     const selected = selectedTeamKey ? items.filter(function (item) {
                         return teamKeyOf(item) === selectedTeamKey;
                     }) : items;
@@ -978,6 +898,9 @@ internal class Comix(context: MangaLoaderContext) :
                                 const page = (meta && meta.page) || 1;
                                 if (!seen.has(page)) {
                                     seen.add(page);
+                                    if (selectedTeamKey === null) {
+                                        selectedTeamKey = mostActiveTeamKey(parsed.result.items);
+                                    }
                                     for (const it of parsed.result.items) items.push(it);
                                     if (meta && meta.hasNext) {
                                         let tries = 0;
