@@ -5,6 +5,9 @@ import okhttp3.HttpUrl.Companion.toHttpUrl
 import okhttp3.Request
 import okhttp3.Response
 import okhttp3.ResponseBody.Companion.toResponseBody
+import okhttp3.MediaType.Companion.toMediaTypeOrNull
+import okhttp3.RequestBody.Companion.toRequestBody
+import org.koitharu.kotatsu.parsers.exception.ParseException
 import org.json.JSONArray
 import org.json.JSONObject
 import org.koitharu.kotatsu.parsers.MangaLoaderContext
@@ -98,7 +101,7 @@ internal class Kagane(context: MangaLoaderContext) :
             .add("Referer", "https://$domain/")
             .build()
         return try {
-            context.cookieJar.copyCookies(domain, "yuzuki.kagane.to")
+            context.cookieJar.copyCookies(domain, "yuzuki.kagane.to", arrayOf("cf_clearance", "__cf_bm"))
             val raw = webClient.httpGet("$apiUrl/api/v2/genres/list", headers).parseRaw()
             val genres = runCatching { JSONArray(raw) }.getOrElse {
                 val wrapper = runCatching { JSONObject(raw) }.getOrNull()
@@ -139,35 +142,47 @@ internal class Kagane(context: MangaLoaderContext) :
         jsonBody: JSONObject? = null
     ): JSONObject {
         val requestUrl = url.toHttpUrl()
-        context.cookieJar.copyCookies(domain, requestUrl.host)
-        val responseBody = try {
-            if (jsonBody != null) {
-                webClient.httpPost(requestUrl, jsonBody, headers).parseRaw()
-            } else {
-                webClient.httpGet(url, headers).parseRaw()
-            }
-        } catch (e: Exception) {
-            val msg = e.message.orEmpty()
-            val isCloudflareOrForbidden = e is org.jsoup.HttpStatusException && (e.statusCode == 403 || e.statusCode == 503)
-            if (isCloudflareOrForbidden || msg.contains("cloudflare", ignoreCase = true) || msg.contains("403", ignoreCase = true) || msg.contains("503", ignoreCase = true)) {
+        context.cookieJar.copyCookies(domain, requestUrl.host, arrayOf("cf_clearance", "__cf_bm"))
+        
+        val requestBuilder = okhttp3.Request.Builder()
+            .url(requestUrl)
+            .headers(headers)
+            .tag(MangaSource::class.java, source)
+            
+        if (jsonBody != null) {
+            val mediaType = "application/json; charset=utf-8".toMediaTypeOrNull()
+            requestBuilder.post(jsonBody.toString().toRequestBody(mediaType))
+        } else {
+            requestBuilder.get()
+        }
+        
+        val response = context.httpClient.newCall(requestBuilder.build()).await()
+        val responseBody = response.body?.string().orEmpty()
+        
+        if (!response.isSuccessful) {
+            val code = response.code
+            val isCloudflareOrForbidden = code == 403 || code == 503
+            val isCfMsg = responseBody.contains("cloudflare", ignoreCase = true) || 
+                          responseBody.contains("just a moment", ignoreCase = true) ||
+                          responseBody.contains("cf-browser-verification", ignoreCase = true)
+            
+            if (isCloudflareOrForbidden || isCfMsg) {
                 try {
                     context.requestBrowserAction(this, "https://$domain/")
                 } catch (ea: UnsupportedOperationException) {
-                    throw org.koitharu.kotatsu.parsers.exception.ParseException(
+                    throw ParseException(
                         "Cloudflare verification is required. Please solve the check on the homepage.",
                         "https://$domain/",
-                        e
+                        Exception("HTTP $code: $responseBody")
                     )
                 }
             }
-            if (e is org.jsoup.HttpStatusException) {
-                throw org.koitharu.kotatsu.parsers.exception.ParseException(
-                    "HTTP error ${e.statusCode}: ${e.message}",
-                    "https://$domain/",
-                    e
-                )
-            }
-            throw e
+            
+            throw ParseException(
+                "HTTP error $code: $responseBody",
+                "https://$domain/",
+                Exception("HTTP $code")
+            )
         }
 
         return try {
@@ -181,14 +196,14 @@ internal class Kagane(context: MangaLoaderContext) :
                 try {
                     context.requestBrowserAction(this, "https://$domain/")
                 } catch (ea: UnsupportedOperationException) {
-                    throw org.koitharu.kotatsu.parsers.exception.ParseException(
+                    throw ParseException(
                         "Cloudflare verification is required. Please solve the check on the homepage.",
                         "https://$domain/",
                         e
                     )
                 }
             }
-            throw org.koitharu.kotatsu.parsers.exception.ParseException(
+            throw ParseException(
                 "Invalid API response (possibly blocked by Cloudflare). Please open the website to verify.",
                 "https://$domain/",
                 e
@@ -436,7 +451,7 @@ internal class Kagane(context: MangaLoaderContext) :
             val challengeResp = getChallengeResponse(chapterId)
             val token = challengeResp.accessToken
             val currentCacheUrl = challengeResp.cacheUrl
-            context.cookieJar.copyCookies(domain, currentCacheUrl.toHttpUrl().host)
+            context.cookieJar.copyCookies(domain, currentCacheUrl.toHttpUrl().host, arrayOf("cf_clearance", "__cf_bm"))
 
             val pages = challengeResp.pages.map { page ->
                 val imageUrl = "$currentCacheUrl/api/v2/books/page/$chapterId/${page.pageUuid}.${page.ext}?token=$token&is_datasaver=false"
@@ -491,7 +506,7 @@ internal class Kagane(context: MangaLoaderContext) :
         val integrityToken = getIntegrityToken()
 
         val challengeUrl = "$apiUrl/api/v2/books/$chapterId?is_datasaver=false"
-        context.cookieJar.copyCookies(domain, challengeUrl.toHttpUrl().host)
+        context.cookieJar.copyCookies(domain, challengeUrl.toHttpUrl().host, arrayOf("cf_clearance", "__cf_bm"))
         val jsonBody = JSONObject()
 
         val headers = getRequestHeaders().newBuilder()
