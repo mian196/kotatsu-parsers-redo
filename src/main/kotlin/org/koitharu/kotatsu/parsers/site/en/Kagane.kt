@@ -194,6 +194,7 @@ internal class Kagane(context: MangaLoaderContext) :
         if (jsonBody != null) {
             val mediaType = "application/json; charset=utf-8".toMediaTypeOrNull()
             requestBuilder.post(jsonBody.toString().toRequestBody(mediaType))
+            requestBuilder.addHeader("Content-Encoding", "identity")
         } else {
             requestBuilder.get()
         }
@@ -687,8 +688,19 @@ internal class Kagane(context: MangaLoaderContext) :
 
 
     override fun intercept(chain: Interceptor.Chain): Response {
-        val request = chain.request()
-        val url = request.url
+        val originalRequest = chain.request()
+        val url = originalRequest.url
+        
+        // Remove encoding headers from requests to avoid gzip compression issues
+        val request = if (originalRequest.method == "GET" || originalRequest.method == "POST") {
+            originalRequest.newBuilder()
+                .removeHeader("Content-Encoding")
+                .removeHeader("Accept-Encoding")
+                .build()
+        } else {
+            originalRequest
+        }
+
         if (url.queryParameterNames.contains("token")) {
             val response = chain.proceed(request)
             if (response.code == 401 || response.code == 403 || response.code == 507) {
