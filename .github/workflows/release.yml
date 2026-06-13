@@ -1,0 +1,92 @@
+name: Kotatsu-Redo CI Auto-Build & Release
+
+on:
+  push:
+    branches:
+      - master
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          path: 'upstream'
+          
+      - name: JDK 17
+        uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+          
+      - name: Build Standard JAR
+        run: |
+          cd upstream
+          # Bytecode compatibility patch for Kototoro Native JVM Host
+          sed -i 's/public val source: MangaParserSource/public val source: MangaSource/g' src/main/kotlin/org/koitharu/kotatsu/parsers/MangaParser.kt
+          # API Retention Patch for Kototoro Broken Source Filter
+          sed -i 's/@Retention(AnnotationRetention.SOURCE)/@Retention(AnnotationRetention.RUNTIME)/g' src/main/kotlin/org/koitharu/kotatsu/parsers/Broken.kt
+          sed -i 's/internal annotation class Broken/public annotation class Broken/g' src/main/kotlin/org/koitharu/kotatsu/parsers/Broken.kt
+          sed -i 's/@Retention(AnnotationRetention.SOURCE)/@Retention(AnnotationRetention.RUNTIME)/g' src/main/kotlin/org/koitharu/kotatsu/parsers/MangaSourceParser.kt
+          sed -i 's/internal annotation class MangaSourceParser/public annotation class MangaSourceParser/g' src/main/kotlin/org/koitharu/kotatsu/parsers/MangaSourceParser.kt
+          chmod +x ./gradlew
+          ./gradlew jar --no-daemon
+        
+      - name: D8 Dex Engine Packaging
+        run: |
+          BUILD_TOOLS_DIR=$(ls -d $ANDROID_HOME/build-tools/* | tail -1)
+          D8_PATH="$BUILD_TOOLS_DIR/d8"
+          ANDROID_JAR="$ANDROID_HOME/platforms/android-34/android.jar"
+          cd upstream/build/libs
+          JAR_FILE=$(ls *.jar | head -n 1)
+          $D8_PATH --release --lib $ANDROID_JAR --output . $JAR_FILE
+          jar cvf plugin.jar classes.dex
+          mkdir -p ../../../deploy_new/apk
+          cp plugin.jar ../../../deploy_new/apk/
+
+          cat << 'EOF' > ../../../deploy_new/index.min.json
+          [
+            {
+              "name": "Kotatsu-Redo Parsers",
+              "pkg": "org.skepsun.kototoro.parsers.redo",
+              "version": "1.0.${{ github.run_number }}",
+              "code": ${{ github.run_number }},
+              "apk": "plugin.jar",
+              "lang": "all",
+              "nsfw": 1
+            }
+          ]
+          EOF
+          cd ../..
+          UPSTREAM_COMMIT=$(git rev-parse HEAD)
+          echo "$UPSTREAM_COMMIT" > ../deploy_new/upstream_commit.txt
+
+      - name: Push to Repo Deploy Branch
+        uses: peaceiris/actions-gh-pages@v3
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_dir: ./deploy_new
+          publish_branch: repo
+          force_orphan: true
+
+      - name: Upload JAR Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: plugin-jar
+          path: deploy_new/apk/plugin.jar
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v1.0.${{ github.run_number }}
+          name: Release v1.0.${{ github.run_number }}
+          files: deploy_new/apk/plugin.jar
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
