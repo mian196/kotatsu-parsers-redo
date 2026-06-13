@@ -384,6 +384,22 @@ internal class Kagane(context: MangaLoaderContext) :
                     .ifBlank { ch.optString("releaseDate") }
                     .ifBlank { ch.optString("created_at") }
                     .substringBefore('T')
+
+                val groupsArr = ch.optJSONArray("groups")
+                val groupNames = if (groupsArr != null && groupsArr.length() > 0) {
+                    buildList {
+                        for (j in 0 until groupsArr.length()) {
+                            val g = groupsArr.optJSONObject(j) ?: continue
+                            val gName = g.optString("title").ifBlank { g.optString("name") }
+                            if (gName.isNotBlank()) {
+                                add(gName)
+                            }
+                        }
+                    }.joinToString(" & ").takeIf { it.isNotBlank() }
+                } else {
+                    null
+                }
+
                 chapters.add(
                     MangaChapter(
                         id = generateUid("$seriesId:$chId"),
@@ -393,17 +409,18 @@ internal class Kagane(context: MangaLoaderContext) :
                         url = "/series/$seriesId/$chId?pages=$pageCount",
                         uploadDate = try { dateFormat.parse(dateStr)?.time ?: 0L } catch (_: Exception) { 0L },
                         source = source,
-                        scanlator = null,
-                        branch = null,
+                        scanlator = groupNames,
+                        branch = groupNames,
                     ),
                 )
             }
-            return chapters.sortedWith(
-                compareBy<MangaChapter> { it.number <= 0f }
-                    .thenBy { it.number }
-                    .thenBy { it.volume }
-                    .thenBy { it.title.orEmpty() },
-            )
+            return chapters.distinctBy { Triple(it.branch, it.volume, it.number) }
+                .sortedWith(
+                    compareBy<MangaChapter> { it.number <= 0f }
+                        .thenBy { it.number }
+                        .thenBy { it.volume }
+                        .thenBy { it.title.orEmpty() },
+                )
         }
 
         var chapters = parseChapters(
