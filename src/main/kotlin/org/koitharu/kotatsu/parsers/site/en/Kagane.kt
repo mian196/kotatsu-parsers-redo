@@ -98,6 +98,7 @@ internal class Kagane(context: MangaLoaderContext) :
             .add("Referer", "https://$domain/")
             .build()
         return try {
+            context.cookieJar.copyCookies(domain, "yuzuki.kagane.to")
             val raw = webClient.httpGet("$apiUrl/api/v2/genres/list", headers).parseRaw()
             val genres = runCatching { JSONArray(raw) }.getOrElse {
                 val wrapper = runCatching { JSONObject(raw) }.getOrNull()
@@ -137,9 +138,11 @@ internal class Kagane(context: MangaLoaderContext) :
         headers: okhttp3.Headers,
         jsonBody: JSONObject? = null
     ): JSONObject {
+        val requestUrl = url.toHttpUrl()
+        context.cookieJar.copyCookies(domain, requestUrl.host)
         val responseBody = try {
             if (jsonBody != null) {
-                webClient.httpPost(url.toHttpUrl(), jsonBody, headers).parseRaw()
+                webClient.httpPost(requestUrl, jsonBody, headers).parseRaw()
             } else {
                 webClient.httpGet(url, headers).parseRaw()
             }
@@ -433,6 +436,7 @@ internal class Kagane(context: MangaLoaderContext) :
             val challengeResp = getChallengeResponse(chapterId)
             val token = challengeResp.accessToken
             val currentCacheUrl = challengeResp.cacheUrl
+            context.cookieJar.copyCookies(domain, currentCacheUrl.toHttpUrl().host)
 
             val pages = challengeResp.pages.map { page ->
                 val imageUrl = "$currentCacheUrl/api/v2/books/page/$chapterId/${page.pageUuid}.${page.ext}?token=$token&is_datasaver=false"
@@ -487,6 +491,7 @@ internal class Kagane(context: MangaLoaderContext) :
         val integrityToken = getIntegrityToken()
 
         val challengeUrl = "$apiUrl/api/v2/books/$chapterId?is_datasaver=false"
+        context.cookieJar.copyCookies(domain, challengeUrl.toHttpUrl().host)
         val jsonBody = JSONObject()
 
         val headers = getRequestHeaders().newBuilder()
