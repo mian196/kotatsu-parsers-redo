@@ -171,10 +171,7 @@ internal class Kagane(context: MangaLoaderContext) :
         copyCookiesToHost(domain, requestUrl.host, arrayOf("cf_clearance", "__cf_bm"))
         
         val cleanClient = context.httpClient.newBuilder()
-            .cookieJar(object : okhttp3.CookieJar {
-                override fun saveFromResponse(url: okhttp3.HttpUrl, cookies: List<okhttp3.Cookie>) {}
-                override fun loadForRequest(url: okhttp3.HttpUrl): List<okhttp3.Cookie> = emptyList()
-            })
+            .cookieJar(okhttp3.CookieJar.NO_COOKIES)
             .build()
             
         val requestBuilder = okhttp3.Request.Builder()
