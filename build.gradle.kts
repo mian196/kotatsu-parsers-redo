@@ -29,10 +29,25 @@ tasks.withType<org.jetbrains.kotlin.gradle.tasks.KotlinCompile>().configureEach 
     }
 }
 
+val filterSources by tasks.registering(Copy::class) {
+    from("src/main/kotlin")
+    into(layout.buildDirectory.dir("filtered-sources"))
+    exclude("**/ComixParser.kt", "**/BatCave.kt", "**/YaoiMangaOnline.kt", "**/MangaLivre.kt")
+}
+
+tasks.configureEach {
+    if (name.startsWith("kspKotlin") || name.startsWith("compileKotlin")) {
+        dependsOn(filterSources)
+    }
+}
+
 kotlin {
     jvmToolchain(17)
     explicitApiWarning()
-    sourceSets["main"].kotlin.srcDirs("build/generated/ksp/main/kotlin")
+    sourceSets["main"].kotlin {
+        setSrcDirs(listOf(layout.buildDirectory.dir("filtered-sources")))
+        srcDir("build/generated/ksp/main/kotlin")
+    }
 }
 
 publishing {

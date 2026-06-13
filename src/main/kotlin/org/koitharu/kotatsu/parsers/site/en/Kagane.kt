@@ -16,7 +16,6 @@ import org.koitharu.kotatsu.parsers.config.ConfigKey
 import org.koitharu.kotatsu.parsers.core.PagedMangaParser
 import org.koitharu.kotatsu.parsers.model.*
 import org.koitharu.kotatsu.parsers.util.*
-import org.koitharu.kotatsu.parsers.webview.InterceptionConfig
 import java.math.BigInteger
 import java.net.URI
 import java.net.URLDecoder
