@@ -45,10 +45,7 @@ internal class Kagane(context: MangaLoaderContext) :
         SortOrder.ALPHABETICAL
     )
 
-    override fun onCreateConfig(keys: MutableCollection<ConfigKey<*>>) {
-        super.onCreateConfig(keys)
-        keys.add(ConfigKey.InterceptCloudflare(defaultValue = true))
-    }
+
 
     override val filterCapabilities: MangaListFilterCapabilities
         get() = MangaListFilterCapabilities(
