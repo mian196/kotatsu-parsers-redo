@@ -101,8 +101,7 @@ internal class Kagane(context: MangaLoaderContext) :
             .add("Referer", "https://$domain/")
             .build()
         return try {
-            context.cookieJar.copyCookies(domain, "yuzuki.kagane.to", arrayOf("cf_clearance", "__cf_bm"))
-            val raw = webClient.httpGet("$apiUrl/api/v2/genres/list", headers).parseRaw()
+            val raw = callApi("$apiUrl/api/v2/genres/list", headers)
             val genres = runCatching { JSONArray(raw) }.getOrElse {
                 val wrapper = runCatching { JSONObject(raw) }.getOrNull()
                 wrapper?.optJSONArray("content")
@@ -136,19 +135,65 @@ internal class Kagane(context: MangaLoaderContext) :
         }
     }
 
-    private suspend fun getApiJson(
+    private fun copyCookiesToHost(oldDomain: String, newDomain: String, names: Array<String>) {
+        val oldUrl = okhttp3.HttpUrl.Builder()
+            .scheme("https")
+            .host(oldDomain)
+            .build()
+        val cookies = context.cookieJar.loadForRequest(oldUrl)
+            .filter { it.name in names }
+        if (cookies.isEmpty()) return
+        
+        val newUrl = okhttp3.HttpUrl.Builder()
+            .scheme("https")
+            .host(newDomain)
+            .build()
+            
+        val newCookies = cookies.map { c ->
+            val builder = okhttp3.Cookie.Builder()
+                .name(c.name)
+                .value(c.value)
+                .domain(newDomain)
+                .path(c.path)
+            if (c.secure) builder.secure()
+            if (c.httpOnly) builder.httpOnly()
+            builder.build()
+        }
+        context.cookieJar.saveFromResponse(newUrl, newCookies)
+    }
+
+    private suspend fun callApi(
         url: String,
         headers: okhttp3.Headers,
         jsonBody: JSONObject? = null
-    ): JSONObject {
+    ): String {
         val requestUrl = url.toHttpUrl()
-        context.cookieJar.copyCookies(domain, requestUrl.host, arrayOf("cf_clearance", "__cf_bm"))
+        copyCookiesToHost(domain, requestUrl.host, arrayOf("cf_clearance", "__cf_bm"))
         
+        val cleanClient = context.httpClient.newBuilder()
+            .cookieJar(object : okhttp3.CookieJar {
+                override fun saveFromResponse(url: okhttp3.HttpUrl, cookies: List<okhttp3.Cookie>) {}
+                override fun loadForRequest(url: okhttp3.HttpUrl): List<okhttp3.Cookie> = emptyList()
+            })
+            .build()
+            
         val requestBuilder = okhttp3.Request.Builder()
             .url(requestUrl)
             .headers(headers)
             .tag(MangaSource::class.java, source)
             
+        val mainDomainUrl = okhttp3.HttpUrl.Builder()
+            .scheme("https")
+            .host(domain)
+            .build()
+        val cookies = context.cookieJar.loadForRequest(mainDomainUrl)
+            .filter { it.name == "cf_clearance" || it.name == "__cf_bm" }
+            
+        if (cookies.isNotEmpty()) {
+            val cookieHeader = cookies.joinToString("; ") { "${it.name}=${it.value}" }
+            requestBuilder.addHeader("Cookie", cookieHeader)
+        }
+        
         if (jsonBody != null) {
             val mediaType = "application/json; charset=utf-8".toMediaTypeOrNull()
             requestBuilder.post(jsonBody.toString().toRequestBody(mediaType))
@@ -156,7 +201,7 @@ internal class Kagane(context: MangaLoaderContext) :
             requestBuilder.get()
         }
         
-        val response = context.httpClient.newCall(requestBuilder.build()).await()
+        val response = cleanClient.newCall(requestBuilder.build()).await()
         val responseBody = response.body?.string().orEmpty()
         
         if (!response.isSuccessful) {
@@ -184,7 +229,16 @@ internal class Kagane(context: MangaLoaderContext) :
                 Exception("HTTP $code")
             )
         }
+        
+        return responseBody
+    }
 
+    private suspend fun getApiJson(
+        url: String,
+        headers: okhttp3.Headers,
+        jsonBody: JSONObject? = null
+    ): JSONObject {
+        val responseBody = callApi(url, headers, jsonBody)
         return try {
             JSONObject(responseBody)
         } catch (e: Exception) {
@@ -468,7 +522,7 @@ internal class Kagane(context: MangaLoaderContext) :
             val challengeResp = getChallengeResponse(chapterId)
             val token = challengeResp.accessToken
             val currentCacheUrl = challengeResp.cacheUrl
-            context.cookieJar.copyCookies(domain, currentCacheUrl.toHttpUrl().host, arrayOf("cf_clearance", "__cf_bm"))
+            copyCookiesToHost(domain, currentCacheUrl.toHttpUrl().host, arrayOf("cf_clearance", "__cf_bm"))
 
             val pages = challengeResp.pages.map { page ->
                 val imageUrl = "$currentCacheUrl/api/v2/books/page/$chapterId/${page.pageUuid}.${page.ext}?token=$token&is_datasaver=false"
@@ -523,7 +577,6 @@ internal class Kagane(context: MangaLoaderContext) :
         val integrityToken = getIntegrityToken()
 
         val challengeUrl = "$apiUrl/api/v2/books/$chapterId?is_datasaver=false"
-        context.cookieJar.copyCookies(domain, challengeUrl.toHttpUrl().host, arrayOf("cf_clearance", "__cf_bm"))
         val jsonBody = JSONObject()
 
         val headers = getRequestHeaders().newBuilder()
@@ -532,7 +585,7 @@ internal class Kagane(context: MangaLoaderContext) :
             .add("x-integrity-token", integrityToken)
             .build()
 
-        val responseBody = webClient.httpPost(challengeUrl.toHttpUrl(), jsonBody, headers).parseJson()
+        val responseBody = getApiJson(challengeUrl, headers, jsonBody)
 
         val token = responseBody.optString("access_token").ifBlank {
             responseBody.optString("accessToken")
@@ -593,11 +646,8 @@ internal class Kagane(context: MangaLoaderContext) :
 
         runCatching { webClient.httpGet("https://$domain/", headers).close() }
 
-        val response = webClient.httpPost(
-            urlBuilder().addPathSegments("api/integrity").build(),
-            JSONObject(),
-            headers,
-        ).parseJson()
+        val integrityUrl = urlBuilder().addPathSegments("api/integrity").build().toString()
+        val response = getApiJson(integrityUrl, headers, JSONObject())
 
         val token = response.optString("token")
         if (token.isBlank()) {
