@@ -513,44 +513,22 @@ internal class Kagane(context: MangaLoaderContext) :
         val seriesId = pathParts[1]
         val chapterId = pathParts[2]
 
-        return try {
-            val challengeResp = getChallengeResponse(chapterId)
-            val token = challengeResp.accessToken
-            val currentCacheUrl = challengeResp.cacheUrl
-            copyCookiesToHost(domain, currentCacheUrl.toHttpUrl().host, arrayOf("cf_clearance", "__cf_bm"))
+        val challengeResp = getChallengeResponse(chapterId)
+        val token = challengeResp.accessToken
+        val currentCacheUrl = challengeResp.cacheUrl
+        copyCookiesToHost(domain, currentCacheUrl.toHttpUrl().host, arrayOf("cf_clearance", "__cf_bm"))
 
-            val pages = challengeResp.pages.map { page ->
-                val imageUrl = "$currentCacheUrl/api/v2/books/page/$chapterId/${page.pageUuid}.${page.ext}?token=$token&is_datasaver=false"
-                MangaPage(
-                    id = generateUid(imageUrl),
-                    url = imageUrl,
-                    preview = null,
-                    source = source,
-                )
-            }
-            if (pages.isEmpty()) throw Exception("No pages returned from API")
-            pages
-        } catch (e: Exception) {
-            dbg("API page fetch failed: ${e.message}. Falling back to WebView capture...")
-            val readerUrl = "https://kagane.to/series/$seriesId/reader/$chapterId"
-            val pattern = Regex(".*/api/v2/books/page/.*", RegexOption.IGNORE_CASE)
-            val imageUrls = runCatching {
-                context.captureWebViewUrls(readerUrl, pattern, timeout = 30000L)
-            }.getOrElse { webViewError ->
-                throw org.koitharu.kotatsu.parsers.exception.ParseException("Failed to load pages via both API and WebView", readerUrl, e)
-            }
-            if (imageUrls.isEmpty()) {
-                throw org.koitharu.kotatsu.parsers.exception.ParseException("WebView did not capture any image URLs", readerUrl)
-            }
-            imageUrls.map { imageUrl ->
-                MangaPage(
-                    id = generateUid(imageUrl),
-                    url = imageUrl,
-                    preview = null,
-                    source = source,
-                )
-            }
+        val pages = challengeResp.pages.map { page ->
+            val imageUrl = "$currentCacheUrl/api/v2/books/page/$chapterId/${page.pageUuid}.${page.ext}?token=$token&is_datasaver=false"
+            MangaPage(
+                id = generateUid(imageUrl),
+                url = imageUrl,
+                preview = null,
+                source = source,
+            )
         }
+        if (pages.isEmpty()) throw Exception("No pages returned from API")
+        return pages
     }
 
     private class ChallengeResponse(
