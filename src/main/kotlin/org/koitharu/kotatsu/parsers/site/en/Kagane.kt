@@ -132,6 +132,67 @@ internal class Kagane(context: MangaLoaderContext) :
         }
     }
 
+    private suspend fun getApiJson(
+        url: String,
+        headers: okhttp3.Headers,
+        jsonBody: JSONObject? = null
+    ): JSONObject {
+        val responseBody = try {
+            if (jsonBody != null) {
+                webClient.httpPost(url.toHttpUrl(), jsonBody, headers).parseRaw()
+            } else {
+                webClient.httpGet(url, headers).parseRaw()
+            }
+        } catch (e: Exception) {
+            val msg = e.message.orEmpty()
+            val isCloudflareOrForbidden = e is org.jsoup.HttpStatusException && (e.statusCode == 403 || e.statusCode == 503)
+            if (isCloudflareOrForbidden || msg.contains("cloudflare", ignoreCase = true) || msg.contains("403", ignoreCase = true) || msg.contains("503", ignoreCase = true)) {
+                try {
+                    context.requestBrowserAction(this, "https://$domain/")
+                } catch (ea: UnsupportedOperationException) {
+                    throw org.koitharu.kotatsu.parsers.exception.ParseException(
+                        "Cloudflare verification is required. Please solve the check on the homepage.",
+                        "https://$domain/",
+                        e
+                    )
+                }
+            }
+            if (e is org.jsoup.HttpStatusException) {
+                throw org.koitharu.kotatsu.parsers.exception.ParseException(
+                    "HTTP error ${e.statusCode}: ${e.message}",
+                    "https://$domain/",
+                    e
+                )
+            }
+            throw e
+        }
+
+        return try {
+            JSONObject(responseBody)
+        } catch (e: Exception) {
+            val isCloudflare = responseBody.contains("cloudflare", ignoreCase = true) || 
+                responseBody.contains("just a moment", ignoreCase = true) ||
+                responseBody.contains("cf-browser-verification", ignoreCase = true) ||
+                responseBody.contains("cf-chl-opt", ignoreCase = true)
+            if (isCloudflare) {
+                try {
+                    context.requestBrowserAction(this, "https://$domain/")
+                } catch (ea: UnsupportedOperationException) {
+                    throw org.koitharu.kotatsu.parsers.exception.ParseException(
+                        "Cloudflare verification is required. Please solve the check on the homepage.",
+                        "https://$domain/",
+                        e
+                    )
+                }
+            }
+            throw org.koitharu.kotatsu.parsers.exception.ParseException(
+                "Invalid API response (possibly blocked by Cloudflare). Please open the website to verify.",
+                "https://$domain/",
+                e
+            )
+        }
+    }
+
     override suspend fun getListPage(page: Int, order: SortOrder, filter: MangaListFilter): List<Manga> {
         val sortParam = when (order) {
             SortOrder.UPDATED -> "updated_at,desc"
@@ -162,13 +223,7 @@ internal class Kagane(context: MangaLoaderContext) :
             .add("Referer", "https://$domain/")
             .build()
 
-        val responseBody = webClient.httpPost(url.toHttpUrl(), jsonBody, headers).parseRaw()
-
-        val response = try {
-            JSONObject(responseBody)
-        } catch (e: Exception) {
-            throw Exception("Invalid JSON search response: $responseBody")
-        }
+        val response = getApiJson(url, headers, jsonBody)
 
         val content = response.optJSONArray("content")
             ?: response.optJSONObject("result")?.optJSONArray("items")
@@ -212,14 +267,7 @@ internal class Kagane(context: MangaLoaderContext) :
             .add("Origin", "https://$domain")
             .add("Referer", "https://$domain/")
             .build()
-        val resp = webClient.httpGet(url, headers)
-        val respBody = resp.body?.string() ?: ""
-        if (!resp.isSuccessful) throw Exception("Details error ${resp.code}: $respBody")
-        val json = try {
-            JSONObject(respBody)
-        } catch (e: Exception) {
-            throw Exception("Invalid JSON details: $respBody")
-        }
+        val json = getApiJson(url, headers)
 
         val state = when (
             json.optString("publication_status")
@@ -349,7 +397,7 @@ internal class Kagane(context: MangaLoaderContext) :
         )
         if (chapters.isEmpty()) {
             val chaptersUrl = "$apiUrl/api/v2/series/$seriesId/books/list"
-            val chapterResp = webClient.httpGet(chaptersUrl, headers).parseJson()
+            val chapterResp = getApiJson(chaptersUrl, headers)
             chapters = parseChapters(
                 chapterResp.optJSONArray("series_books")
                     ?: chapterResp.optJSONArray("seriesBooks")
